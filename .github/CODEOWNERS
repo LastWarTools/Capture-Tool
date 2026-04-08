@@ -1,0 +1,6 @@
+# Code Owners for Last War Capture Tool
+# These users will be automatically requested for review on PRs.
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owners for everything in the repo
+* @dregimbal1 @WeAreBitBoss
