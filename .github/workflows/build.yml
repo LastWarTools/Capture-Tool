@@ -1,0 +1,44 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Npcap SDK
+        shell: powershell
+        run: |
+          # PyInstaller needs scapy to import, which needs npcap headers
+          # Install npcap OEM silent (or SDK for build only)
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile npcap-sdk.zip
+          Expand-Archive npcap-sdk.zip -DestinationPath npcap-sdk
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build executable
+        run: |
+          pyinstaller --onefile ^
+            --windowed ^
+            --name "LastWarCapture" ^
+            --hidden-import=scapy.layers.all ^
+            --hidden-import=scapy.arch.windows ^
+            lastwar_capture.py
+        shell: cmd
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LastWarCapture-windows
+          path: dist/LastWarCapture.exe
