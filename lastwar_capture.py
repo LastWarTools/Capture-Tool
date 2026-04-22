@@ -84,6 +84,7 @@ class CaptureApp:
         self.log_messages = []
         self.game_server_ip = None
         self.game_server_port = None
+        self._stream_buf = {}  # TCP stream reassembly buffer
 
         # Get available interfaces
         self.interfaces = get_active_interfaces() if SCAPY_AVAILABLE else []
@@ -254,6 +255,7 @@ class CaptureApp:
         self.login_data = None
         self.game_server_ip = None
         self.game_server_port = None
+        self._stream_buf = {}
         self.packets_seen = 0
         self.handshake_label.config(text="○  Handshake: waiting...", style='Waiting.TLabel')
         self.login_label.config(text="○  Login: waiting...", style='Waiting.TLabel')
@@ -316,32 +318,51 @@ class CaptureApp:
                     self.game_server_port = dport
                     self.root.after(0, self.on_handshake_captured)
 
-                # Step 2: Capture auth packet (non-e405 high entropy, ~300-500 bytes)
-                elif (self.handshake_data is not None and self.auth_data is None and
+                # Steps 2+3: Buffer all post-handshake data to same server
+                # and split on next SFS header to reassemble fragmented auth packet
+                elif (self.handshake_data is not None and self.login_data is None and
                       self.game_server_ip and dst_ip == self.game_server_ip and
                       self.game_server_port and dport == self.game_server_port):
 
-                    if not is_protocol_packet and len(data) >= 200:
-                        sample = data[:100] if len(data) >= 100 else data
-                        entropy = len(set(sample))
-                        if entropy > 50:
+                    key = (src_ip, dst_ip, sport, dport)
+                    if key not in self._stream_buf:
+                        self._stream_buf[key] = bytearray()
+                    self._stream_buf[key].extend(data)
+                    buf = self._stream_buf[key]
+
+                    # Look for SFS header boundary in accumulated buffer
+                    sfs_pos = -1
+                    # Skip pos 0 — if buffer starts with SFS, it may be a
+                    # small protocol ACK before auth data; scan from byte 1
+                    for i in range(1, len(buf) - 1):
+                        if buf[i] == 0xE4 and buf[i + 1] in (0x05, 0x06):
+                            sfs_pos = i
+                            break
+
+                    if sfs_pos > 0:
+                        # Everything before the SFS header = auth packet
+                        if self.auth_data is None:
+                            auth_candidate = bytes(buf[:sfs_pos])
+                            if len(auth_candidate) >= 200:
+                                sample = auth_candidate[:100]
+                                if len(set(sample)) > 50:
+                                    self.packets_seen += 1
+                                    self.log(f"[2] Auth packet: {len(auth_candidate)} bytes (reassembled)")
+                                    self.auth_data = auth_candidate
+                                    self.root.after(0, self.on_auth_captured)
+
+                        # SFS data at sfs_pos onward = login packet
+                        sfs_data = bytes(buf[sfs_pos:])
+                        sfs_header = sfs_data[:2]
+                        is_login = sfs_header in (self.E405_HEADER, self.E406_HEADER)
+                        if (self.auth_data is not None and self.login_data is None
+                                and is_login and len(sfs_data) > 500):
                             self.packets_seen += 1
-                            self.log(f"[2] Auth packet: {len(data)} bytes, header={header.hex()}")
-                            self.auth_data = data
-                            self.root.after(0, self.on_auth_captured)
+                            self.log(f"[3] Login trigger: {len(sfs_data)} bytes to {dst_ip}:{dport}")
+                            self.login_data = sfs_data
+                            self.root.after(0, self.on_login_captured)
 
-                # Step 3: Capture second e405 packet (login trigger)
-                # Must go to SAME server as handshake - this is a DIFFERENT e405 packet
-                elif (self.handshake_data is not None and self.auth_data is not None and
-                      self.login_data is None and
-                      self.game_server_ip and dst_ip == self.game_server_ip and
-                      self.game_server_port and dport == self.game_server_port):
-
-                    if is_game_packet and len(data) > 500:
-                        self.packets_seen += 1
-                        self.log(f"[3] Login trigger: {len(data)} bytes to {dst_ip}:{dport}")
-                        self.login_data = data
-                        self.root.after(0, self.on_login_captured)
+                        buf.clear()
 
         self.log(f"Listening on {self.selected_interface}")
 
