@@ -289,8 +289,9 @@ class CaptureApp:
         self.game_server_ip = None
         self.game_server_port = None
         self.packets_seen = 0
-        self._private_ip_warned = set()
         self._stream_buf = {}  # TCP stream reassembly buffer
+        self._capture_dst_ip = None   # Actual packet destination (may be proxy)
+        self._capture_dst_port = None
         self.handshake_label.config(text="○  Handshake: waiting...", style='Waiting.TLabel')
         self.login_label.config(text="○  Login: waiting...", style='Waiting.TLabel')
         self.upload_btn.config(state=tk.DISABLED)
@@ -341,35 +342,41 @@ class CaptureApp:
                 )
                 is_game_packet = header in (self.E405_HEADER, self.E406_HEADER)
 
-                # Skip packets to private/local IPs (capture proxies, VPNs, etc.)
-                if is_game_packet and is_private_ip(dst_ip):
-                    if not hasattr(self, '_private_ip_warned'):
-                        self._private_ip_warned = set()
-                    key = f"{dst_ip}:{dport}"
-                    if key not in self._private_ip_warned:
-                        self._private_ip_warned.add(key)
-                        self.log(f"Skipping private IP {key} (local proxy) - waiting for real game server")
-                    return
-
                 # Step 1: Capture first e405/e406 packet (handshake)
                 if (is_game_packet and self.handshake_data is None and
                         MIN_HANDSHAKE_SIZE <= len(data) <= MAX_HANDSHAKE_SIZE):
                     self.packets_seen += 1
-                    self.log(f"[1] Handshake to {dst_ip}:{dport}: {len(data)} bytes")
 
                     self.protocol = "e406" if header == self.E406_HEADER else "e405"
                     self.handshake_data = data
-                    self.game_server_ip = dst_ip
-                    self.game_server_port = dport
+
+                    # Record game server IP/port — if destination is a private
+                    # IP (local proxy/VPN), use the known public game server
+                    # and keep the port (it's usually correct even through proxies)
+                    if is_private_ip(dst_ip):
+                        self.game_server_ip = "172.65.210.24"
+                        self.game_server_port = dport
+                        self.log(f"[1] Handshake via proxy {dst_ip}:{dport}: {len(data)} bytes "
+                                 f"(using public IP {self.game_server_ip})")
+                    else:
+                        self.game_server_ip = dst_ip
+                        self.game_server_port = dport
+                        self.log(f"[1] Handshake to {dst_ip}:{dport}: {len(data)} bytes")
+
+                    # For steps 2+3, match on the actual dst (could be proxy)
+                    self._capture_dst_ip = dst_ip
+                    self._capture_dst_port = dport
                     self.root.after(0, self.on_handshake_captured)
 
-                # Steps 2+3: Buffer post-handshake data to same server and
+                # Steps 2+3: Buffer post-handshake data to same destination and
                 # reassemble fragmented TCP segments. The auth packet (non-protocol,
                 # high entropy) and login packet (second e405/e406) may arrive
                 # split across multiple TCP segments.
+                # Match on actual destination (may be a local proxy), not the
+                # corrected public IP we store for the API.
                 elif (self.handshake_data is not None and self.login_data is None and
-                      self.game_server_ip and dst_ip == self.game_server_ip and
-                      self.game_server_port and dport == self.game_server_port):
+                      self._capture_dst_ip and dst_ip == self._capture_dst_ip and
+                      self._capture_dst_port and dport == self._capture_dst_port):
 
                     key = (src_ip, dst_ip, sport, dport)
                     if key not in self._stream_buf:
