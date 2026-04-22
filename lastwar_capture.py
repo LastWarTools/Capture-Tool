@@ -58,6 +58,40 @@ def get_active_interfaces():
     return interfaces
 
 
+def is_private_ip(ip: str) -> bool:
+    """Check if an IP address is private/local (capture proxy, not real game server)."""
+    if not ip:
+        return True
+    parts = ip.split('.')
+    if len(parts) != 4:
+        return True
+    try:
+        first, second = int(parts[0]), int(parts[1])
+    except ValueError:
+        return True
+    if first == 10:
+        return True
+    if first == 172 and 16 <= second <= 31:
+        return True
+    if first == 192 and second == 168:
+        return True
+    if first == 127:
+        return True
+    return False
+
+
+# Expected blob size ranges based on known-good captures
+# Handshake: ~400-2000 bytes (e405 ~460B, e406 ~1862B)
+# Auth:      ~200-2000 bytes (~1.3-1.4 KiB typical)
+# Login:     ~400-2000 bytes (~1.4 KiB typical)
+MIN_HANDSHAKE_SIZE = 300
+MAX_HANDSHAKE_SIZE = 5000
+MIN_AUTH_SIZE = 200
+MAX_AUTH_SIZE = 5000
+MIN_LOGIN_SIZE = 300
+MAX_LOGIN_SIZE = 5000
+
+
 class CaptureApp:
     E405_HEADER = b'\xe4\x05'
     E406_HEADER = b'\xe4\x06'
@@ -84,7 +118,6 @@ class CaptureApp:
         self.log_messages = []
         self.game_server_ip = None
         self.game_server_port = None
-        self._stream_buf = {}  # TCP stream reassembly buffer
 
         # Get available interfaces
         self.interfaces = get_active_interfaces() if SCAPY_AVAILABLE else []
@@ -255,8 +288,9 @@ class CaptureApp:
         self.login_data = None
         self.game_server_ip = None
         self.game_server_port = None
-        self._stream_buf = {}
         self.packets_seen = 0
+        self._private_ip_warned = set()
+        self._stream_buf = {}  # TCP stream reassembly buffer
         self.handshake_label.config(text="○  Handshake: waiting...", style='Waiting.TLabel')
         self.login_label.config(text="○  Login: waiting...", style='Waiting.TLabel')
         self.upload_btn.config(state=tk.DISABLED)
@@ -307,8 +341,19 @@ class CaptureApp:
                 )
                 is_game_packet = header in (self.E405_HEADER, self.E406_HEADER)
 
+                # Skip packets to private/local IPs (capture proxies, VPNs, etc.)
+                if is_game_packet and is_private_ip(dst_ip):
+                    if not hasattr(self, '_private_ip_warned'):
+                        self._private_ip_warned = set()
+                    key = f"{dst_ip}:{dport}"
+                    if key not in self._private_ip_warned:
+                        self._private_ip_warned.add(key)
+                        self.log(f"Skipping private IP {key} (local proxy) - waiting for real game server")
+                    return
+
                 # Step 1: Capture first e405/e406 packet (handshake)
-                if is_game_packet and len(data) > 500 and self.handshake_data is None:
+                if (is_game_packet and self.handshake_data is None and
+                        MIN_HANDSHAKE_SIZE <= len(data) <= MAX_HANDSHAKE_SIZE):
                     self.packets_seen += 1
                     self.log(f"[1] Handshake to {dst_ip}:{dport}: {len(data)} bytes")
 
@@ -318,8 +363,10 @@ class CaptureApp:
                     self.game_server_port = dport
                     self.root.after(0, self.on_handshake_captured)
 
-                # Steps 2+3: Buffer all post-handshake data to same server
-                # and split on next SFS header to reassemble fragmented auth packet
+                # Steps 2+3: Buffer post-handshake data to same server and
+                # reassemble fragmented TCP segments. The auth packet (non-protocol,
+                # high entropy) and login packet (second e405/e406) may arrive
+                # split across multiple TCP segments.
                 elif (self.handshake_data is not None and self.login_data is None and
                       self.game_server_ip and dst_ip == self.game_server_ip and
                       self.game_server_port and dport == self.game_server_port):
@@ -330,20 +377,35 @@ class CaptureApp:
                     self._stream_buf[key].extend(data)
                     buf = self._stream_buf[key]
 
-                    # Look for SFS header boundary in accumulated buffer
-                    sfs_pos = -1
-                    # Skip pos 0 — if buffer starts with SFS, it may be a
-                    # small protocol ACK before auth data; scan from byte 1
+                    # Try direct capture first (non-fragmented case)
+                    if self.auth_data is None and not is_protocol_packet:
+                        if MIN_AUTH_SIZE <= len(data) <= MAX_AUTH_SIZE:
+                            sample = data[:100] if len(data) >= 100 else data
+                            if len(set(sample)) > 50:
+                                self.packets_seen += 1
+                                self.log(f"[2] Auth packet: {len(data)} bytes, header={header.hex()}")
+                                self.auth_data = data
+                                self._stream_buf[key] = bytearray()
+                                self.root.after(0, self.on_auth_captured)
+                                return
+
+                    if self.auth_data is not None and is_game_packet:
+                        if MIN_LOGIN_SIZE <= len(data) <= MAX_LOGIN_SIZE:
+                            self.packets_seen += 1
+                            self.log(f"[3] Login trigger: {len(data)} bytes to {dst_ip}:{dport}")
+                            self.login_data = data
+                            self.root.after(0, self.on_login_captured)
+                            return
+
+                    # Reassembly: scan buffer for e405/e406 boundary that splits
+                    # auth data (before) from login packet (after)
                     for i in range(1, len(buf) - 1):
                         if buf[i] == 0xE4 and buf[i + 1] in (0x05, 0x06):
-                            sfs_pos = i
-                            break
+                            auth_candidate = bytes(buf[:i])
+                            login_candidate = bytes(buf[i:])
 
-                    if sfs_pos > 0:
-                        # Everything before the SFS header = auth packet
-                        if self.auth_data is None:
-                            auth_candidate = bytes(buf[:sfs_pos])
-                            if len(auth_candidate) >= 200:
+                            if (self.auth_data is None and
+                                    MIN_AUTH_SIZE <= len(auth_candidate) <= MAX_AUTH_SIZE):
                                 sample = auth_candidate[:100]
                                 if len(set(sample)) > 50:
                                     self.packets_seen += 1
@@ -351,18 +413,16 @@ class CaptureApp:
                                     self.auth_data = auth_candidate
                                     self.root.after(0, self.on_auth_captured)
 
-                        # SFS data at sfs_pos onward = login packet
-                        sfs_data = bytes(buf[sfs_pos:])
-                        sfs_header = sfs_data[:2]
-                        is_login = sfs_header in (self.E405_HEADER, self.E406_HEADER)
-                        if (self.auth_data is not None and self.login_data is None
-                                and is_login and len(sfs_data) > 500):
-                            self.packets_seen += 1
-                            self.log(f"[3] Login trigger: {len(sfs_data)} bytes to {dst_ip}:{dport}")
-                            self.login_data = sfs_data
-                            self.root.after(0, self.on_login_captured)
+                            if (self.auth_data is not None and self.login_data is None and
+                                    login_candidate[:2] in (self.E405_HEADER, self.E406_HEADER) and
+                                    MIN_LOGIN_SIZE <= len(login_candidate) <= MAX_LOGIN_SIZE):
+                                self.packets_seen += 1
+                                self.log(f"[3] Login trigger: {len(login_candidate)} bytes (reassembled)")
+                                self.login_data = login_candidate
+                                self.root.after(0, self.on_login_captured)
 
-                        buf.clear()
+                            buf.clear()
+                            break
 
         self.log(f"Listening on {self.selected_interface}")
 
@@ -407,7 +467,10 @@ class CaptureApp:
         self.status_label.config(text="✓ Capture complete!", foreground='#2e7d32')
         self.upload_btn.config(state=tk.NORMAL)
         self.save_btn.config(state=tk.NORMAL)
-        self.log("Capture complete")
+        self.log(f"Capture complete: server={self.game_server_ip}:{self.game_server_port}")
+        self.log(f"  handshake={len(self.handshake_data)}B, "
+                 f"auth={len(self.auth_data)}B, "
+                 f"login={len(self.login_data)}B")
         self.root.bell()
 
     def upload_credentials(self):
@@ -436,12 +499,12 @@ class CaptureApp:
 
                 headers = {'X-API-Key': api_key}
 
-                # Include server IP/port as query params
+                # Include server IP/port as query params (skip private IPs)
                 params = {}
-                if self.game_server_ip:
+                if self.game_server_ip and not is_private_ip(self.game_server_ip):
                     params['server_ip'] = self.game_server_ip
-                if self.game_server_port:
-                    params['server_port'] = self.game_server_port
+                    if self.game_server_port:
+                        params['server_port'] = self.game_server_port
 
                 self.log(f"Upload params: {params}")
                 self.log(f"game_server_ip={self.game_server_ip}, game_server_port={self.game_server_port}")
