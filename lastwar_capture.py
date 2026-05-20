@@ -95,16 +95,18 @@ MAX_LOGIN_SIZE = 5000
 class CaptureApp:
     E405_HEADER = b'\xe4\x05'
     E406_HEADER = b'\xe4\x06'
+    E407_HEADER = b'\xe4\x07'
     # c4xx headers are also protocol packets (possibly responses/acks)
     C405_HEADER = b'\xc4\x05'
     C406_HEADER = b'\xc4\x06'
+    C407_HEADER = b'\xc4\x07'
 
     def __init__(self, root):
         self.root = root
         self.root.title("Last War Credential Capture")
-        self.root.geometry("480x550")
+        self.root.geometry("480x650")
         self.root.resizable(True, True)
-        self.root.minsize(400, 500)
+        self.root.minsize(400, 600)
 
         # State
         self.capturing = False
@@ -118,7 +120,6 @@ class CaptureApp:
         self.log_messages = []
         self.game_server_ip = None
         self.game_server_port = None
-
         # Get available interfaces
         self.interfaces = get_active_interfaces() if SCAPY_AVAILABLE else []
 
@@ -143,10 +144,24 @@ class CaptureApp:
         ttk.Label(main, text="Capture your game credentials for API access",
                   style='Subtitle.TLabel').pack(anchor=tk.W, pady=(0, 15))
 
-        # Network interface
-        ttk.Label(main, text="Network Interface:", font=('Segoe UI', 9, 'bold')).pack(anchor=tk.W)
+        # --- Step 1: API Key ---
+        apikey_frame = ttk.LabelFrame(main, text="Step 1: Enter API Key", padding=15)
+        apikey_frame.pack(fill=tk.X, pady=(0, 10))
+
+        key_frame = ttk.Frame(apikey_frame)
+        key_frame.pack(fill=tk.X)
+        ttk.Label(key_frame, text="API Key:", font=('Segoe UI', 9)).pack(side=tk.LEFT)
+        self.apikey_entry = ttk.Entry(key_frame, width=40, show="•")
+        self.apikey_entry.pack(side=tk.LEFT, padx=(10, 0), fill=tk.X, expand=True)
+        self.apikey_entry.bind('<KeyRelease>', self._on_apikey_changed)
+
+        # --- Step 2: Network Interface + Capture ---
+        capture_frame = ttk.LabelFrame(main, text="Step 2: Capture Credentials", padding=15)
+        capture_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(capture_frame, text="Network Interface:", font=('Segoe UI', 9, 'bold')).pack(anchor=tk.W)
         self.iface_var = tk.StringVar()
-        self.iface_combo = ttk.Combobox(main, textvariable=self.iface_var, state='readonly')
+        self.iface_combo = ttk.Combobox(capture_frame, textvariable=self.iface_var, state='readonly')
         if self.interfaces:
             iface_values = [f"{friendly} ({addr})" for name, addr, friendly in self.interfaces]
             self.iface_combo['values'] = iface_values
@@ -160,19 +175,22 @@ class CaptureApp:
             self.selected_interface = self.interfaces[selected_idx][0]
         else:
             self.iface_combo['values'] = ["No interfaces found - install Npcap"]
-        self.iface_combo.pack(fill=tk.X, pady=(5, 15))
+        self.iface_combo.pack(fill=tk.X, pady=(5, 10))
         self.iface_combo.bind('<<ComboboxSelected>>', self.on_interface_changed)
 
-        # Capture button
-        self.capture_btn = ttk.Button(main, text="▶  Start Capture", style='Big.TButton',
-                                      command=self.toggle_capture)
-        self.capture_btn.pack(fill=tk.X, pady=(0, 15))
+        self.capture_btn = ttk.Button(capture_frame, text="▶  Start Capture", style='Big.TButton',
+                                      command=self.toggle_capture, state=tk.DISABLED)
+        self.capture_btn.pack(fill=tk.X, pady=(0, 5))
+
+        self.capture_hint = ttk.Label(capture_frame, text="Enter and validate your API key first",
+                                      font=('Segoe UI', 9), foreground='#999')
+        self.capture_hint.pack(anchor=tk.W)
 
         # Status section
         status_frame = ttk.LabelFrame(main, text="Status", padding=15)
-        status_frame.pack(fill=tk.X, pady=(0, 15))
+        status_frame.pack(fill=tk.X, pady=(0, 10))
 
-        self.status_label = ttk.Label(status_frame, text="Ready to capture",
+        self.status_label = ttk.Label(status_frame, text="Ready",
                                       font=('Segoe UI', 10))
         self.status_label.pack(anchor=tk.W)
 
@@ -189,28 +207,14 @@ class CaptureApp:
                                      style='Waiting.TLabel', font=('Segoe UI', 10))
         self.login_label.pack(anchor=tk.W, pady=2)
 
-        # Actions section
-        actions_frame = ttk.LabelFrame(main, text="Actions", padding=15)
-        actions_frame.pack(fill=tk.X, pady=(0, 10))
+        self.validate_label = ttk.Label(status_frame, text="",
+                                        font=('Segoe UI', 10))
+        self.validate_label.pack(anchor=tk.W, pady=2)
 
-        # API Key entry
-        key_frame = ttk.Frame(actions_frame)
-        key_frame.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(key_frame, text="API Key:", font=('Segoe UI', 9)).pack(side=tk.LEFT)
-        self.apikey_entry = ttk.Entry(key_frame, width=40, show="•")
-        self.apikey_entry.pack(side=tk.LEFT, padx=(10, 0), fill=tk.X, expand=True)
-
-        # Buttons row
-        btn_frame = ttk.Frame(actions_frame)
-        btn_frame.pack(fill=tk.X)
-
-        self.upload_btn = ttk.Button(btn_frame, text="Upload to API",
-                                     command=self.upload_credentials, state=tk.DISABLED)
-        self.upload_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-
-        self.save_btn = ttk.Button(btn_frame, text="Save Files",
+        # Post-capture actions
+        self.save_btn = ttk.Button(main, text="Save Files Locally",
                                    command=self.save_locally, state=tk.DISABLED)
-        self.save_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
+        self.save_btn.pack(fill=tk.X, pady=(0, 10))
 
         # Debug log button (small, at bottom)
         bottom_frame = ttk.Frame(main)
@@ -255,6 +259,16 @@ class CaptureApp:
             self.selected_interface = name
             self.log(f"Selected: {friendly} ({addr})")
 
+    def _on_apikey_changed(self, event=None):
+        """Enable/disable capture button based on whether API key is entered."""
+        api_key = self.apikey_entry.get().strip()
+        if api_key:
+            self.capture_btn.config(state=tk.NORMAL)
+            self.capture_hint.config(text="Click Start Capture, then open the game")
+        else:
+            self.capture_btn.config(state=tk.DISABLED)
+            self.capture_hint.config(text="Enter your API key first")
+
     def check_dependencies(self):
         """Check if scapy/npcap is available."""
         if not SCAPY_AVAILABLE:
@@ -278,7 +292,7 @@ class CaptureApp:
 
         self.capturing = True
         self.capture_btn.config(text="■  Stop Capture")
-        self.status_label.config(text="● Capturing... Open game and log in", foreground='#1565c0')
+        self.status_label.config(text="● Capturing... Open Last War now and log in", foreground='#1565c0')
         self.packets_label.config(text="Packets: 0")
         self.log(f"Started capture on {self.selected_interface}")
 
@@ -292,9 +306,12 @@ class CaptureApp:
         self._stream_buf = {}  # TCP stream reassembly buffer
         self._capture_dst_ip = None   # Actual packet destination (may be proxy)
         self._capture_dst_port = None
+        self._size_warned = set()
+        self._game_pkt_count = 0      # Count of e405/e406 packets seen
+        self._unknown_logged = set()  # Unique unknown packet signatures logged
         self.handshake_label.config(text="○  Handshake: waiting...", style='Waiting.TLabel')
         self.login_label.config(text="○  Login: waiting...", style='Waiting.TLabel')
-        self.upload_btn.config(state=tk.DISABLED)
+        self.validate_label.config(text="")
         self.save_btn.config(state=tk.DISABLED)
 
         self.capture_thread = threading.Thread(target=self.capture_packets, daemon=True)
@@ -306,6 +323,12 @@ class CaptureApp:
 
         if not self.handshake_data:
             self.status_label.config(text="Stopped - no handshake captured", foreground='#666')
+            if self._game_pkt_count == 0:
+                self.log("Capture stopped — no game packets seen. "
+                         "Check: correct network interface? Game running?")
+            else:
+                self.log(f"Capture stopped — saw {self._game_pkt_count} game packets "
+                         f"but none matched handshake criteria.")
         elif not self.auth_data:
             self.status_label.config(text="Stopped - no auth packet captured", foreground='#c62828')
         elif not self.login_data:
@@ -337,17 +360,43 @@ class CaptureApp:
                 # Check for game protocol header (client->server packets)
                 header = data[:2] if len(data) >= 2 else b''
                 is_protocol_packet = header in (
-                    self.E405_HEADER, self.E406_HEADER,
-                    self.C405_HEADER, self.C406_HEADER
+                    self.E405_HEADER, self.E406_HEADER, self.E407_HEADER,
+                    self.C405_HEADER, self.C406_HEADER, self.C407_HEADER,
                 )
-                is_game_packet = header in (self.E405_HEADER, self.E406_HEADER)
+                is_game_packet = header in (self.E405_HEADER, self.E406_HEADER, self.E407_HEADER)
+
+                # Diagnostic: log large outbound packets to non-standard ports
+                # This helps identify game traffic using unknown protocol headers
+                if (self.handshake_data is None and self._game_pkt_count == 0 and
+                        len(data) >= 200 and dport > 10000):
+                    if not hasattr(self, '_unknown_logged'):
+                        self._unknown_logged = set()
+                    log_key = (dst_ip, dport, header)
+                    if log_key not in self._unknown_logged:
+                        self._unknown_logged.add(log_key)
+                        self.log(f"[?] Large packet to {dst_ip}:{dport}: "
+                                 f"{len(data)} bytes, header={data[:4].hex()}")
+
+                # Diagnostic logging for game packets
+                if is_game_packet:
+                    self._game_pkt_count += 1
+                    if self._game_pkt_count == 1:
+                        self.log(f"First game packet: {header.hex()} to {dst_ip}:{dport}, {len(data)} bytes")
+                    if self.handshake_data is None:
+                        if not (MIN_HANDSHAKE_SIZE <= len(data) <= MAX_HANDSHAKE_SIZE):
+                            size_key = len(data)
+                            if size_key not in self._size_warned:
+                                self._size_warned.add(size_key)
+                                self.log(f"[!] Game packet ({header.hex()}) to {dst_ip}:{dport}: "
+                                         f"{len(data)} bytes — outside size range "
+                                         f"({MIN_HANDSHAKE_SIZE}-{MAX_HANDSHAKE_SIZE})")
 
                 # Step 1: Capture first e405/e406 packet (handshake)
                 if (is_game_packet and self.handshake_data is None and
                         MIN_HANDSHAKE_SIZE <= len(data) <= MAX_HANDSHAKE_SIZE):
                     self.packets_seen += 1
 
-                    self.protocol = "e406" if header == self.E406_HEADER else "e405"
+                    self.protocol = header.hex()
                     self.handshake_data = data
 
                     # Record game server IP/port — if destination is a private
@@ -368,14 +417,11 @@ class CaptureApp:
                     self._capture_dst_port = dport
                     self.root.after(0, self.on_handshake_captured)
 
-                # Steps 2+3: Buffer post-handshake data to same destination and
-                # reassemble fragmented TCP segments. The auth packet (non-protocol,
-                # high entropy) and login packet (second e405/e406) may arrive
-                # split across multiple TCP segments.
-                # Match on actual destination (may be a local proxy), not the
-                # corrected public IP we store for the API.
+                # Steps 2+3: Buffer post-handshake data to same game server port.
+                # The game client may try multiple server IPs for the same port
+                # (e.g. 172.65.210.24:18797, 3.33.246.23:18797, 34.145.128.94:18797)
+                # so we match on port only, not IP.
                 elif (self.handshake_data is not None and self.login_data is None and
-                      self._capture_dst_ip and dst_ip == self._capture_dst_ip and
                       self._capture_dst_port and dport == self._capture_dst_port):
 
                     key = (src_ip, dst_ip, sport, dport)
@@ -407,7 +453,7 @@ class CaptureApp:
                     # Reassembly: scan buffer for e405/e406 boundary that splits
                     # auth data (before) from login packet (after)
                     for i in range(1, len(buf) - 1):
-                        if buf[i] == 0xE4 and buf[i + 1] in (0x05, 0x06):
+                        if buf[i] == 0xE4 and buf[i + 1] in (0x05, 0x06, 0x07):
                             auth_candidate = bytes(buf[:i])
                             login_candidate = bytes(buf[i:])
 
@@ -421,7 +467,7 @@ class CaptureApp:
                                     self.root.after(0, self.on_auth_captured)
 
                             if (self.auth_data is not None and self.login_data is None and
-                                    login_candidate[:2] in (self.E405_HEADER, self.E406_HEADER) and
+                                    login_candidate[:2] in (self.E405_HEADER, self.E406_HEADER, self.E407_HEADER) and
                                     MIN_LOGIN_SIZE <= len(login_candidate) <= MAX_LOGIN_SIZE):
                                 self.packets_seen += 1
                                 self.log(f"[3] Login trigger: {len(login_candidate)} bytes (reassembled)")
@@ -467,85 +513,116 @@ class CaptureApp:
         header = self.login_data[:2].hex() if len(self.login_data) >= 2 else "??"
         self.login_label.config(text=f"✓  Login: {size} bytes (header: {header})", style='Success.TLabel')
         self.log(f"Captured login packet: {size} bytes, header={header}")
+
+        # Upload to API immediately
+        self.validate_label.config(
+            text="⟳  Uploading credentials...", foreground='#1565c0')
+        self.status_label.config(
+            text="Uploading captured credentials...", foreground='#1565c0')
+        threading.Thread(target=self._upload_and_finish, daemon=True).start()
+
+    def _upload_and_finish(self):
+        try:
+            success, message = self._do_upload()
+            if success:
+                self.root.after(0, lambda: self._on_upload_success(message))
+            else:
+                self.root.after(0, lambda: self._on_validation_failed(message))
+        except Exception as e:
+            self.log(f"Upload error: {e}")
+            self.root.after(0, lambda: self._on_validation_failed(str(e)))
+
+    def _do_upload(self):
+        """Upload credentials to API and check if they are accepted.
+        Returns (success: bool, message: str)."""
+        api_key = self.apikey_entry.get().strip()
+
+        files = {
+            'handshake': ('handshake.bin', self.handshake_data, 'application/octet-stream'),
+        }
+        if self.auth_data:
+            files['auth_packet'] = ('auth.bin', self.auth_data, 'application/octet-stream')
+        if self.login_data:
+            files['login'] = ('login.bin', self.login_data, 'application/octet-stream')
+
+        headers = {'X-API-Key': api_key}
+
+        # Resolve server IP before validation
+        server_ip = self.game_server_ip
+        if server_ip != "172.65.210.24" and self.game_server_port:
+            import socket as _s
+            try:
+                test = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+                test.settimeout(3)
+                test.connect(("172.65.210.24", self.game_server_port))
+                test.close()
+                server_ip = "172.65.210.24"
+                self.log(f"Server IP: 172.65.210.24:{self.game_server_port} reachable")
+            except:
+                self.log(f"172.65.210.24:{self.game_server_port} not reachable, "
+                         f"keeping {server_ip}")
+
+        params = {}
+        if server_ip and not is_private_ip(server_ip):
+            params['server_ip'] = server_ip
+            if self.game_server_port:
+                params['server_port'] = self.game_server_port
+
+        self.log(f"Uploading: handshake={len(self.handshake_data)}B, "
+                 f"auth={len(self.auth_data) if self.auth_data else 0}B, "
+                 f"login={len(self.login_data) if self.login_data else 0}B, "
+                 f"server={server_ip}:{self.game_server_port}")
+
+        response = requests.post(
+            f"{API_BASE_URL}/auth/credentials/upload",
+            headers=headers,
+            files=files,
+            params=params,
+            timeout=30
+        )
+
+        if response.ok:
+            self.game_server_ip = server_ip
+            result = response.json() if response.headers.get('content-type', '').startswith('application/json') else {}
+            validation = result.get('validation', '')
+            if validation == 'failed':
+                error = result.get('player_info', {}).get('validation_error', 'Credentials invalid or expired')
+                return False, error
+            return True, result.get('message', 'Credentials uploaded successfully')
+        else:
+            try:
+                error = response.json().get('detail', response.text)
+            except:
+                error = response.text
+            return False, error
+
+    def _on_upload_success(self, message):
+        """Called when API accepts the upload."""
+        self.log(f"Upload success: {message}")
+        self.validate_label.config(
+            text="✓  Uploaded successfully", style='Success.TLabel')
         self.on_capture_complete()
+
+    def _on_validation_failed(self, message):
+        """Called when API rejects credentials. Stop capture."""
+        self.log(f"Upload FAILED: {message}")
+        self.stop_capture()
+        self.validate_label.config(
+            text=f"✗  Upload failed", foreground='#c62828')
+        self.status_label.config(
+            text=f"⚠ Upload failed — check API key and try again", foreground='#c62828')
+        messagebox.showerror("Upload Failed", str(message))
 
     def on_capture_complete(self):
         self.stop_capture()
-        self.status_label.config(text="✓ Capture complete!", foreground='#2e7d32')
-        self.upload_btn.config(state=tk.NORMAL)
+
+        self.status_label.config(text="✓ Done! Credentials captured and uploaded.", foreground='#2e7d32')
         self.save_btn.config(state=tk.NORMAL)
-        self.log(f"Capture complete: server={self.game_server_ip}:{self.game_server_port}")
+        self.log(f"Complete: server={self.game_server_ip}:{self.game_server_port}")
         self.log(f"  handshake={len(self.handshake_data)}B, "
                  f"auth={len(self.auth_data)}B, "
                  f"login={len(self.login_data)}B")
         self.root.bell()
-
-    def upload_credentials(self):
-        api_key = self.apikey_entry.get().strip()
-
-        if not api_key:
-            messagebox.showwarning("Missing API Key", "Please enter your API key.")
-            return
-
-        if not self.handshake_data:
-            messagebox.showwarning("No Data", "No credentials captured yet.")
-            return
-
-        self.upload_btn.config(state=tk.DISABLED)
-        self.status_label.config(text="Uploading...", foreground='#1565c0')
-
-        def do_upload():
-            try:
-                files = {
-                    'handshake': ('handshake.bin', self.handshake_data, 'application/octet-stream')
-                }
-                if self.auth_data:
-                    files['auth_packet'] = ('auth.bin', self.auth_data, 'application/octet-stream')
-                if self.login_data:
-                    files['login'] = ('login.bin', self.login_data, 'application/octet-stream')
-
-                headers = {'X-API-Key': api_key}
-
-                # Include server IP/port as query params (skip private IPs)
-                params = {}
-                if self.game_server_ip and not is_private_ip(self.game_server_ip):
-                    params['server_ip'] = self.game_server_ip
-                    if self.game_server_port:
-                        params['server_port'] = self.game_server_port
-
-                self.log(f"Upload params: {params}")
-                self.log(f"game_server_ip={self.game_server_ip}, game_server_port={self.game_server_port}")
-
-                response = requests.post(
-                    f"{API_BASE_URL}/auth/credentials/upload",
-                    headers=headers,
-                    files=files,
-                    params=params,
-                    timeout=30
-                )
-
-                if response.ok:
-                    result = response.json()
-                    self.log(f"Upload success: {result}")
-                    self.root.after(0, lambda: self.status_label.config(
-                        text="✓ Uploaded successfully!", foreground='#2e7d32'))
-                    self.root.after(0, lambda: messagebox.showinfo("Success",
-                        "Credentials uploaded!\n\nYour API access is now active."))
-                else:
-                    error = response.json().get('detail', response.text)
-                    self.log(f"Upload failed: {error}")
-                    self.root.after(0, lambda: self.status_label.config(
-                        text="⚠ Upload failed", foreground='red'))
-                    self.root.after(0, lambda e=error: messagebox.showerror("Upload Failed", str(e)))
-            except Exception as e:
-                self.log(f"Upload error: {e}")
-                self.root.after(0, lambda: self.status_label.config(
-                    text="⚠ Upload error", foreground='red'))
-                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
-            finally:
-                self.root.after(0, lambda: self.upload_btn.config(state=tk.NORMAL))
-
-        threading.Thread(target=do_upload, daemon=True).start()
 
     def save_locally(self):
         folder = filedialog.askdirectory(title="Select folder to save credentials")
