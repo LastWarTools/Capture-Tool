@@ -120,6 +120,11 @@ class CaptureApp:
         self.log_messages = []
         self.game_server_ip = None
         self.game_server_port = None
+        self.attempt_count = 0
+        self._failed_handshakes = set()
+        self._credential_queue = []  # queued (handshake, auth, login, server_ip, port, protocol) tuples
+        self._uploading = False
+
         # Get available interfaces
         self.interfaces = get_active_interfaces() if SCAPY_AVAILABLE else []
 
@@ -260,14 +265,64 @@ class CaptureApp:
             self.log(f"Selected: {friendly} ({addr})")
 
     def _on_apikey_changed(self, event=None):
-        """Enable/disable capture button based on whether API key is entered."""
+        """Validate the API key when user finishes typing."""
         api_key = self.apikey_entry.get().strip()
-        if api_key:
-            self.capture_btn.config(state=tk.NORMAL)
-            self.capture_hint.config(text="Click Start Capture, then open the game")
-        else:
+        if not api_key:
             self.capture_btn.config(state=tk.DISABLED)
             self.capture_hint.config(text="Enter your API key first")
+            return
+
+        # Debounce: schedule validation after a short delay
+        if hasattr(self, '_apikey_after_id') and self._apikey_after_id:
+            self.root.after_cancel(self._apikey_after_id)
+        self._apikey_after_id = self.root.after(500, self._validate_api_key)
+
+    def _validate_api_key(self):
+        """Validate API key against the server."""
+        api_key = self.apikey_entry.get().strip()
+        if not api_key:
+            return
+
+        self.capture_btn.config(state=tk.DISABLED)
+        self.capture_hint.config(text="Validating API key...", foreground='#1565c0')
+
+        def do_validate():
+            try:
+                response = requests.get(
+                    f"{API_BASE_URL}/auth/validate",
+                    headers={'X-API-Key': api_key},
+                    timeout=10
+                )
+                if response.ok:
+                    result = response.json()
+                    display_name = result.get('display_name', '')
+                    self.root.after(0, lambda: self._on_apikey_valid(display_name))
+                else:
+                    try:
+                        detail = response.json().get('detail', 'Invalid API key')
+                    except Exception:
+                        detail = 'Invalid API key'
+                    self.root.after(0, lambda d=detail: self._on_apikey_invalid(d))
+            except requests.exceptions.ConnectionError:
+                self.root.after(0, lambda: self._on_apikey_invalid("Cannot reach API server"))
+            except Exception as e:
+                self.root.after(0, lambda e=e: self._on_apikey_invalid(str(e)))
+
+        threading.Thread(target=do_validate, daemon=True).start()
+
+    def _on_apikey_valid(self, display_name):
+        """Called when API key validation succeeds."""
+        self.capture_btn.config(state=tk.NORMAL)
+        label = f"Key valid ({display_name})" if display_name else "Key valid"
+        self.capture_hint.config(text=f"✓ {label} — Click Start Capture, then open the game",
+                                 foreground='#2e7d32')
+        self.log(f"API key validated: {display_name}")
+
+    def _on_apikey_invalid(self, error):
+        """Called when API key validation fails."""
+        self.capture_btn.config(state=tk.DISABLED)
+        self.capture_hint.config(text=f"✗ {error}", foreground='#c62828')
+        self.log(f"API key invalid: {error}")
 
     def check_dependencies(self):
         """Check if scapy/npcap is available."""
@@ -306,9 +361,14 @@ class CaptureApp:
         self._stream_buf = {}  # TCP stream reassembly buffer
         self._capture_dst_ip = None   # Actual packet destination (may be proxy)
         self._capture_dst_port = None
+        self._capture_src_port = None  # Source port to lock onto specific TCP stream
         self._size_warned = set()
         self._game_pkt_count = 0      # Count of e405/e406 packets seen
         self._unknown_logged = set()  # Unique unknown packet signatures logged
+        self.attempt_count = 0
+        self._failed_handshakes = set()
+        self._credential_queue = []
+        self._uploading = False
         self.handshake_label.config(text="○  Handshake: waiting...", style='Waiting.TLabel')
         self.login_label.config(text="○  Login: waiting...", style='Waiting.TLabel')
         self.validate_label.config(text="")
@@ -366,12 +426,12 @@ class CaptureApp:
                 is_game_packet = header in (self.E405_HEADER, self.E406_HEADER, self.E407_HEADER)
 
                 # Diagnostic: log large outbound packets to non-standard ports
-                # This helps identify game traffic using unknown protocol headers
+                # Skip private IPs (local proxies, VPNs) — only log public destinations
                 if (self.handshake_data is None and self._game_pkt_count == 0 and
-                        len(data) >= 200 and dport > 10000):
+                        len(data) >= 200 and dport > 10000 and not is_private_ip(dst_ip)):
                     if not hasattr(self, '_unknown_logged'):
                         self._unknown_logged = set()
-                    log_key = (dst_ip, dport, header)
+                    log_key = (dst_ip, dport)
                     if log_key not in self._unknown_logged:
                         self._unknown_logged.add(log_key)
                         self.log(f"[?] Large packet to {dst_ip}:{dport}: "
@@ -394,6 +454,10 @@ class CaptureApp:
                 # Step 1: Capture first e405/e406 packet (handshake)
                 if (is_game_packet and self.handshake_data is None and
                         MIN_HANDSHAKE_SIZE <= len(data) <= MAX_HANDSHAKE_SIZE):
+                    # Skip handshakes that already failed
+                    if hash(data) in self._failed_handshakes:
+                        self.log(f"Skipping previously failed handshake ({len(data)} bytes)")
+                        return
                     self.packets_seen += 1
 
                     self.protocol = header.hex()
@@ -412,16 +476,16 @@ class CaptureApp:
                         self.game_server_port = dport
                         self.log(f"[1] Handshake to {dst_ip}:{dport}: {len(data)} bytes")
 
-                    # For steps 2+3, match on the actual dst (could be proxy)
+                    # Lock onto this specific TCP stream for steps 2+3
                     self._capture_dst_ip = dst_ip
                     self._capture_dst_port = dport
+                    self._capture_src_port = sport  # Track source port to identify TCP stream
                     self.root.after(0, self.on_handshake_captured)
 
-                # Steps 2+3: Buffer post-handshake data to same game server port.
-                # The game client may try multiple server IPs for the same port
-                # (e.g. 172.65.210.24:18797, 3.33.246.23:18797, 34.145.128.94:18797)
-                # so we match on port only, not IP.
+                # Steps 2+3: Match on the SAME TCP stream as the handshake
+                # (same src_port + dst_port = same connection)
                 elif (self.handshake_data is not None and self.login_data is None and
+                      self._capture_src_port and sport == self._capture_src_port and
                       self._capture_dst_port and dport == self._capture_dst_port):
 
                     key = (src_ip, dst_ip, sport, dport)
@@ -444,9 +508,15 @@ class CaptureApp:
 
                     if self.auth_data is not None and is_game_packet:
                         if MIN_LOGIN_SIZE <= len(data) <= MAX_LOGIN_SIZE:
+                            # Use the full buffer if it starts with a game header
+                            # (captures fragmented login packets reassembled across TCP segments)
+                            login_candidate = bytes(buf) if (len(buf) >= len(data) and
+                                buf[:2] in (self.E405_HEADER, self.E406_HEADER, self.E407_HEADER)) else data
                             self.packets_seen += 1
-                            self.log(f"[3] Login trigger: {len(data)} bytes to {dst_ip}:{dport}")
-                            self.login_data = data
+                            self.log(f"[3] Login trigger: {len(login_candidate)} bytes to {dst_ip}:{dport}"
+                                     f"{' (reassembled from buffer)' if len(login_candidate) > len(data) else ''}")
+                            self.login_data = login_candidate
+                            self._stream_buf[key] = bytearray()
                             self.root.after(0, self.on_login_captured)
                             return
 
@@ -514,64 +584,99 @@ class CaptureApp:
         self.login_label.config(text=f"✓  Login: {size} bytes (header: {header})", style='Success.TLabel')
         self.log(f"Captured login packet: {size} bytes, header={header}")
 
-        # Upload to API immediately
-        self.validate_label.config(
-            text="⟳  Uploading credentials...", foreground='#1565c0')
-        self.status_label.config(
-            text="Uploading captured credentials...", foreground='#1565c0')
-        threading.Thread(target=self._upload_and_finish, daemon=True).start()
+        # Queue this credential set
+        cred_set = (self.handshake_data, self.auth_data, self.login_data,
+                    self.game_server_ip, self.game_server_port, self.protocol)
+        self._credential_queue.append(cred_set)
+        self.log(f"Queued credential set #{len(self._credential_queue)}")
 
-    def _upload_and_finish(self):
-        try:
-            success, message = self._do_upload()
-            if success:
-                self.root.after(0, lambda: self._on_upload_success(message))
-            else:
-                self.root.after(0, lambda: self._on_validation_failed(message))
-        except Exception as e:
-            self.log(f"Upload error: {e}")
-            self.root.after(0, lambda: self._on_validation_failed(str(e)))
+        # Reset to keep capturing more packets while uploading
+        self.handshake_data = None
+        self.auth_data = None
+        self.login_data = None
+        self.game_server_ip = None
+        self.game_server_port = None
+        self._stream_buf = {}
+        self.handshake_label.config(text="○  Handshake: listening for more...", style='Waiting.TLabel')
+        self.login_label.config(text="○  Login: listening...", style='Waiting.TLabel')
 
-    def _do_upload(self):
-        """Upload credentials to API and check if they are accepted.
-        Returns (success: bool, message: str)."""
+        # Start uploading if not already
+        if not self._uploading:
+            self._uploading = True
+            threading.Thread(target=self._process_queue, daemon=True).start()
+
+    def _process_queue(self):
+        """Process queued credential sets one at a time."""
+        while self._credential_queue:
+            cred_set = self._credential_queue.pop(0)
+            handshake, auth, login, server_ip, server_port, protocol = cred_set
+            self.attempt_count += 1
+            attempt = self.attempt_count
+
+            self.root.after(0, lambda a=attempt: [
+                self.validate_label.config(
+                    text=f"⟳  Trying set #{a}...", foreground='#1565c0'),
+                self.status_label.config(
+                    text=f"Uploading set #{a} ({len(self._credential_queue)} queued)...",
+                    foreground='#1565c0')
+            ])
+
+            try:
+                success, message = self._do_upload_set(handshake, auth, login, server_ip, server_port)
+                if success:
+                    # Store the winning set back
+                    self.handshake_data = handshake
+                    self.auth_data = auth
+                    self.login_data = login
+                    self.game_server_ip = server_ip
+                    self.game_server_port = server_port
+                    self.protocol = protocol
+                    self._uploading = False
+                    self.root.after(0, lambda: self._on_upload_success(message))
+                    return
+                else:
+                    self._failed_handshakes.add(hash(handshake))
+                    self.log(f"Set #{attempt} failed: {message}")
+                    self.root.after(0, lambda a=attempt: self.validate_label.config(
+                        text=f"✗  Set #{a} failed — trying next...", foreground='#c62828'))
+            except Exception as e:
+                self._failed_handshakes.add(hash(handshake))
+                self.log(f"Set #{attempt} error: {e}")
+
+        # Queue exhausted, no success — keep capturing
+        self._uploading = False
+        self.root.after(0, lambda: [
+            self.validate_label.config(
+                text=f"✗  {self.attempt_count} set(s) failed — waiting for more...",
+                foreground='#c62828'),
+            self.status_label.config(
+                text="Waiting for more packets...", foreground='#e65100')
+        ])
+
+    def _do_upload_set(self, handshake, auth, login, server_ip, server_port):
+        """Upload a credential set to API. Returns (success: bool, message: str)."""
         api_key = self.apikey_entry.get().strip()
 
         files = {
-            'handshake': ('handshake.bin', self.handshake_data, 'application/octet-stream'),
+            'handshake': ('handshake.bin', handshake, 'application/octet-stream'),
         }
-        if self.auth_data:
-            files['auth_packet'] = ('auth.bin', self.auth_data, 'application/octet-stream')
-        if self.login_data:
-            files['login'] = ('login.bin', self.login_data, 'application/octet-stream')
+        if auth:
+            files['auth_packet'] = ('auth.bin', auth, 'application/octet-stream')
+        if login:
+            files['login'] = ('login.bin', login, 'application/octet-stream')
 
         headers = {'X-API-Key': api_key}
-
-        # Resolve server IP before validation
-        server_ip = self.game_server_ip
-        if server_ip != "172.65.210.24" and self.game_server_port:
-            import socket as _s
-            try:
-                test = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
-                test.settimeout(3)
-                test.connect(("172.65.210.24", self.game_server_port))
-                test.close()
-                server_ip = "172.65.210.24"
-                self.log(f"Server IP: 172.65.210.24:{self.game_server_port} reachable")
-            except:
-                self.log(f"172.65.210.24:{self.game_server_port} not reachable, "
-                         f"keeping {server_ip}")
 
         params = {}
         if server_ip and not is_private_ip(server_ip):
             params['server_ip'] = server_ip
-            if self.game_server_port:
-                params['server_port'] = self.game_server_port
+            if server_port:
+                params['server_port'] = server_port
 
-        self.log(f"Uploading: handshake={len(self.handshake_data)}B, "
-                 f"auth={len(self.auth_data) if self.auth_data else 0}B, "
-                 f"login={len(self.login_data) if self.login_data else 0}B, "
-                 f"server={server_ip}:{self.game_server_port}")
+        self.log(f"Uploading: handshake={len(handshake)}B, "
+                 f"auth={len(auth) if auth else 0}B, "
+                 f"login={len(login) if login else 0}B, "
+                 f"server={server_ip}:{server_port}")
 
         response = requests.post(
             f"{API_BASE_URL}/auth/credentials/upload",
@@ -582,17 +687,18 @@ class CaptureApp:
         )
 
         if response.ok:
-            self.game_server_ip = server_ip
             result = response.json() if response.headers.get('content-type', '').startswith('application/json') else {}
-            validation = result.get('validation', '')
-            if validation == 'failed':
-                error = result.get('player_info', {}).get('validation_error', 'Credentials invalid or expired')
-                return False, error
+            self.log(f"API response: {result}")
             return True, result.get('message', 'Credentials uploaded successfully')
         else:
+            self.log(f"API error: HTTP {response.status_code}, body={response.text[:200]}")
             try:
-                error = response.json().get('detail', response.text)
-            except:
+                detail = response.json().get('detail', {})
+                if isinstance(detail, dict):
+                    error = detail.get('validation_error', detail.get('message', response.text))
+                else:
+                    error = str(detail)
+            except Exception:
                 error = response.text
             return False, error
 
@@ -602,16 +708,6 @@ class CaptureApp:
         self.validate_label.config(
             text="✓  Uploaded successfully", style='Success.TLabel')
         self.on_capture_complete()
-
-    def _on_validation_failed(self, message):
-        """Called when API rejects credentials. Stop capture."""
-        self.log(f"Upload FAILED: {message}")
-        self.stop_capture()
-        self.validate_label.config(
-            text=f"✗  Upload failed", foreground='#c62828')
-        self.status_label.config(
-            text=f"⚠ Upload failed — check API key and try again", foreground='#c62828')
-        messagebox.showerror("Upload Failed", str(message))
 
     def on_capture_complete(self):
         self.stop_capture()
