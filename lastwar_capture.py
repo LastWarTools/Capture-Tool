@@ -96,10 +96,13 @@ class CaptureApp:
     E405_HEADER = b'\xe4\x05'
     E406_HEADER = b'\xe4\x06'
     E407_HEADER = b'\xe4\x07'
+    E408_HEADER = b'\xe4\x08'
+
     # c4xx headers are also protocol packets (possibly responses/acks)
     C405_HEADER = b'\xc4\x05'
     C406_HEADER = b'\xc4\x06'
     C407_HEADER = b'\xc4\x07'
+    C408_HEADER = b'\xc4\x08'
 
     def __init__(self, root):
         self.root = root
@@ -420,10 +423,21 @@ class CaptureApp:
                 # Check for game protocol header (client->server packets)
                 header = data[:2] if len(data) >= 2 else b''
                 is_protocol_packet = header in (
-                    self.E405_HEADER, self.E406_HEADER, self.E407_HEADER,
-                    self.C405_HEADER, self.C406_HEADER, self.C407_HEADER,
+                    self.E405_HEADER,
+                    self.E406_HEADER,
+                    self.E407_HEADER,
+                    self.E408_HEADER,
+                    self.C405_HEADER,
+                    self.C406_HEADER,
+                    self.C407_HEADER,
+                    self.C408_HEADER,
                 )
-                is_game_packet = header in (self.E405_HEADER, self.E406_HEADER, self.E407_HEADER)
+                is_game_packet = header in (
+                    self.E405_HEADER,
+                    self.E406_HEADER,
+                    self.E407_HEADER,
+                    self.E408_HEADER,
+                )
 
                 # Diagnostic: log large outbound packets to non-standard ports
                 # Skip private IPs (local proxies, VPNs) — only log public destinations
@@ -510,20 +524,33 @@ class CaptureApp:
                         if MIN_LOGIN_SIZE <= len(data) <= MAX_LOGIN_SIZE:
                             # Use the full buffer if it starts with a game header
                             # (captures fragmented login packets reassembled across TCP segments)
-                            login_candidate = bytes(buf) if (len(buf) >= len(data) and
-                                buf[:2] in (self.E405_HEADER, self.E406_HEADER, self.E407_HEADER)) else data
+                            login_candidate = (
+                                bytes(buf)
+                                if (
+                                    len(buf) >= len(data)
+                                    and buf[:2] in (
+                                        self.E405_HEADER,
+                                        self.E406_HEADER,
+                                        self.E407_HEADER,
+                                        self.E408_HEADER,
+                                    )
+                                )
+                                else data
+                            )
                             self.packets_seen += 1
-                            self.log(f"[3] Login trigger: {len(login_candidate)} bytes to {dst_ip}:{dport}"
-                                     f"{' (reassembled from buffer)' if len(login_candidate) > len(data) else ''}")
+                            self.log(
+                                f"[3] Login trigger: {len(login_candidate)} bytes to {dst_ip}:{dport}"
+                                f"{' (reassembled from buffer)' if len(login_candidate) > len(data) else ''}"
+                            )
                             self.login_data = login_candidate
                             self._stream_buf[key] = bytearray()
                             self.root.after(0, self.on_login_captured)
                             return
 
-                    # Reassembly: scan buffer for e405/e406 boundary that splits
+                    # Reassembly: scan buffer for a game packet boundary that splits
                     # auth data (before) from login packet (after)
                     for i in range(1, len(buf) - 1):
-                        if buf[i] == 0xE4 and buf[i + 1] in (0x05, 0x06, 0x07):
+                        if buf[i] == 0xE4 and buf[i + 1] in (0x05, 0x06, 0x07, 0x08):
                             auth_candidate = bytes(buf[:i])
                             login_candidate = bytes(buf[i:])
 
@@ -536,9 +563,17 @@ class CaptureApp:
                                     self.auth_data = auth_candidate
                                     self.root.after(0, self.on_auth_captured)
 
-                            if (self.auth_data is not None and self.login_data is None and
-                                    login_candidate[:2] in (self.E405_HEADER, self.E406_HEADER, self.E407_HEADER) and
-                                    MIN_LOGIN_SIZE <= len(login_candidate) <= MAX_LOGIN_SIZE):
+                            if (
+                                self.auth_data is not None
+                                and self.login_data is None
+                                and login_candidate[:2] in (
+                                    self.E405_HEADER,
+                                    self.E406_HEADER,
+                                    self.E407_HEADER,
+                                    self.E408_HEADER,
+                                )
+                                and MIN_LOGIN_SIZE <= len(login_candidate) <= MAX_LOGIN_SIZE
+                            ):
                                 self.packets_seen += 1
                                 self.log(f"[3] Login trigger: {len(login_candidate)} bytes (reassembled)")
                                 self.login_data = login_candidate
